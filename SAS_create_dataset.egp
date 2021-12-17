@@ -1,0 +1,529 @@
+
+* Libnames; 
+libname LIBBEF "D:\MB\Fuldtællinger\BEF";
+libname LIBUDDA "D:\MB\Fuldtællinger\UDDA";
+libname LIBIND "D:\MB\Fuldtællinger\IND";
+*libname LIBFAIN "D:\MB\Fuldtællinger\FAIN";
+
+
+libname andlun "D:\FM\andlun";
+
+libname jonher "D:\FM\jonher\Lort undervejs";
+libname tidfly "D:\projekt\Nabolagseffekter\BEFBOP";
+
+* Formater; 
+libname fmt 'D:\DOKUMENTATION\SAS formater i Danmarks Statistik\FORMATKATALOG' access=readonly;
+options fmtsearch=(fmt.times_personstatistik fmt.times_erhvervsstatistik fmt.times_bbr 
+                   fmt.statistikbank fmt.brancher fmt.uddannelser fmt.disced fmt.disco fmt.sundhed fmt.geokoder);
+
+* Makroer; 
+	
+
+* Dataår; 
+%let year1=2018; 
+
+
+
+/*Lav en cohorte specifikation*/
+data tidligflyt;
+	set jonher.befbop_ny;
+	fraflyt=year(BOP_VTIL);
+	if fraflyt<=1969 then delete;
+	if KOM<=100 then delete;
+	if KOM=>900 then delete;
+run;
+proc sort data=tidligflyt;
+by ID_nr;
+run;
+data wide1;
+set tidligflyt;
+by ID_nr;
+
+keep ID_nr tilhorskom1970-tilhorskom1974;
+retain tilhorskom1970-tilhorskom1974;
+
+array aadresse(1970:1974) tilhorskom1970-tilhorskom1974;
+
+If first.ID_nr then 
+Do;
+	DO i=1970 to 1974;
+		aadresse(i)=.;
+	end;
+end;
+
+if fraflyt<=1974 then aadresse(fraflyt)=KOM;
+if last.ID_nr then output;
+run;
+data wide2;
+set wide1;
+counters=0;
+array all{*} tilhorskom1970-tilhorskom1974;
+do i=1 to dim(all);
+	if all{i}^=. then counters=counters+1;
+end;
+run;
+
+proc sort data=wide2;
+by counters;
+run;
+
+/*Save old flytteregister*/
+data andlun.oldflyt; set wide2;run;
+
+/*Smart komando til uniques
+proc sort data=wide2;
+by tilhorskom1970;
+
+run;
+proc sort data=tidligflyt;
+by fraflyt;
+run;
+
+proc sort data=tidligflyt nouniquekeys out=duplicates;
+by Adresse_id;
+where fraflyt=1973;
+run;
+
+*/
+
+data mellemflyt (drop=counters sidstekom i forstekom);
+	set jonher.cpstkom_v1;
+run;
+data mellemflyt (drop=kom_ny1975-kom_ny1984);
+	set mellemflyt;
+	array _char (10) kom_ny1975-kom_ny1984;
+	array _num (10) tilhorskom1975-tilhorskom1984;
+	DO i=1 to 10;
+		_num{i}=input(_char{i},8.);
+	End;
+run;
+data tidligflyt (drop=counters i) ; 
+	set andlun.oldflyt;
+run;
+
+proc sort data=mellemflyt;
+	by ID_nr;
+run;
+
+proc sort data=tidligflyt;
+	by ID_nr;
+run;
+
+
+data flyt_for1985;
+	merge tidligflyt mellemflyt;
+	by ID_nr;
+run;
+
+data andlun.flyt_for1985; set flyt_for1985;run;
+
+
+/*Script til at danne og forældres kommuneoversigt*/
+/*We implicitly assume that no child moves out before the age of 15 (for the first cohort) - if missing før tilbage til fødsel*/
+/*Indhent tilhørsforhold*/
+data tilhor;
+	set jonher.beffmmark;
+run; 
+/*Find tidspunkt for hvornår barnet flytter hjemmefra (tidsvariabelt) og skift */
+
+data want_0(drop=i);
+	set tilhor;
+	hjemmefra_år=0;
+	tilhors=0;
+	where fmmark1985<6;
+	array all{*} fmmark1985-fmmark2019;
+	do i=1 to dim(all)-1 until(all{i}=6);
+		if all{i}=6 then hjemmefra_år=i+1985-1;
+		if all{i}=6 then tilhors=all{i-1};
+	end; 
+run;
+/*
+data lol (keep=ID_nr tilhors); set want_0;run;
+proc sort data=lol out=lol nodupkey;
+	by ID_nr;
+run;
+proc export data=lol
+outfile="D:\FM\andlun\df_tilhors"
+dbms=dta replace;
+run;
+*/
+/* XXXXXXXXXXXXXX 2. MERGE BARNETS OG FORÆLDRES BOPÆL XXXXXXXXXXXXXXXXXX*/
+/* Lav det fulde register over, hvor hvilke kommuner det enkelte barns "hovedforældre" har boet hos fra barnet er 0-30 */
+data komflyt (drop=FM_MARK UDD HFAUDD QSPLINDK STATSB KOEN KOM OPR_LAND PERINDKIALT_13);
+	set jonher.befkom;
+run; 
+data tilhorkom;
+	merge komflyt(in=a)want_0(keep=ID_nr hjemmefra_år tilhors);
+	by ID_nr;
+	if a;
+run;
+
+/*LAV MOR/FAR ID dataset og sammensæt det med det relevante barn*/
+data merge_ID;
+	set tilhorkom;
+	if tilhors>=1 and tilhors<=3 then primærbolig= mor_id_nr;
+	if tilhors>=4 and tilhors<=5 then primærbolig= far_id_nr;
+run;
+data merge_IDX(rename=(kom1985-kom2019=forkom1985-forkom2019));
+	set merge_ID;
+run;
+proc sort data=merge_ID;
+	by primærbolig;
+run;
+/*MERGE den rigtige forældre på det enkelte barn*/
+data fullfly;
+	merge merge_ID(in=a) merge_IDX(keep=ID_nr forkom1985-forkom2019 rename=(ID_nr=primærbolig));
+	by primærbolig;
+	if a;
+run;
+proc sort data=fullfly;
+	by ID_nr;
+run;
+/*Lav tilknyttede forældre tilhørskommune oversigt*/
+data fullflyX(drop=i k);
+	set fullfly;
+	array all{*} kom1985-kom2019;
+	array tilhorsfor{*} tilhorskom1985-tilhorskom2019;
+	array all2{*} forkom1985-forkom2019;
+	do i=1 to dim(all) until(i>=hjemmefra_år-1985);
+		tilhorsfor{i}=all{i};
+	end; 
+
+	do k=1 to dim(all) until(k=2019-hjemmefra_år+1);
+		tilhorsfor{dim(all)+1-k}=all2{dim(all)+1-k};
+	end;
+run;
+/*!!!!!! 2.B MERGE NYT DATASÆT SAMMEN MED GAMMELT WIDE FORMAT DATA!!!!!*/
+/*XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX*/
+data oldflyt;
+	set andlun.flyt_for1985;
+run; 
+proc sort data=oldflyt;
+	by ID_nr;
+run;
+
+/*XXXXXXXXXXXXXXXXXX 3. fra barnets forældres bopæl find antallet af adresseændringer XXXXXXXXXXXXXXXXXXXXX*/
+/*Indhent Flytdatasæt */
+data komflyt (keep=ID_nr tilhorskom1985-tilhorskom2019 FOED_DAG hjemmefra_år rename=(hjemmefra_år=hjemmefra_aar));
+	set fullflyX;
+run;
+data komflyt;
+	retain ID_nr FOED_DAG hjemmefra_aar  tilhorskom1970-tilhorskom2019;
+	merge oldflyt komflyt(in=a);
+	by ID_nr;
+	if a;
+run;
+/*Lav datasættet komplet m. årligt tilhørskom for gammel data*/
+data komflyt;
+	set komflyt;
+	cohort= year(FOED_DAG);
+	if cohort=.Z or cohort>=1986 or cohort<=1969 then delete;
+run; 
+/*Udfyld huller i det mergede datasæt - DATA MERGE COMPLETE*/
+data want(drop=i);
+	set komflyt;
+	array all{*} tilhorskom1975-tilhorskom1970;
+	do i=1 to dim(all) while(i<=1975-cohort+1); /*Markerer alder hvortil vi målet forældres flytninger*/
+		if all{i}=. and i>1 then all{i}=all{i-1};
+	end;
+run;
+
+/*Lav en counter for antal gange personen er flyttet i hele sit liv + første reg kommune*/
+data want(drop=i);
+	set want;
+	forstekom = coalesce(of tilhorskom1970-tilhorskom2019);
+	counters=0;
+	sidstekom=.;
+
+	array all{*} tilhorskom1970-tilhorskom2019;
+	do i=1 to dim(all)-1 until(i=cohort+30-1970); /*Markerer alder hvortil vi målet forældres flytninger*/
+		if all{i+1}-all{i} then counters=counters+1;
+		if i=cohort+30-1970 then sidstekom=all{cohort+30+1-1970};
+	end;
+
+run;
+/*Lav en variabel, m, for alderen hvor barnet flyttede første gang*/
+data want1 (drop=i);
+set want;
+alderflyt=.;
+array all{*} tilhorskom1970-tilhorskom2019;
+do i=1 to dim(all)-1 while(alderflyt=.);
+		if all{i+1}-all{i}^=0 and all{i}^=. and all{i+1}^=. then alderflyt=i+1970;
+
+end; 
+alderflyt=alderflyt-cohort;
+if alderflyt>30 then alderflyt=.;
+run;
+/*____________________________________________________________________________________*/
+/* 4. FINDER OG MERGER CIVILSTAND + INDKOMST i år m-1, m og m+1 omring første flytning og sæt tilbage på oprindelig*/
+/*_____________________________________________________________*/
+
+data addinfo;
+	merge want1(in=a) fullflyX;
+	by ID_nr;
+	if a;
+run;
+data addinfo(keep=ID_nr primærbolig alderflyt cohort);
+	set addinfo;
+run;
+data civst;
+set jonher.bef_civst;
+run;
+
+proc sort data=addinfo;
+	by primærbolig;
+run;
+proc sort data=civst;
+	by ID_nr;
+run;
+data addinfo1;
+	merge addinfo(in=a) civst(rename=(ID_nr=primærbolig));
+	by primærbolig;
+	if a;
+run;
+data aegtefalle (drop=i);
+	set addinfo1;
+	array all1{*} civst1985-civst2019;
+	array all2{*} $ civ_m0-civ_m2;
+	do i=1 to 3;
+		if alderflyt+cohort>=1986 then all2{i}=all1{cohort+alderflyt+i-1-1985};
+	end;
+run;
+
+data dm_ind;
+set jonher.dm_ind;
+run;
+proc sort data=dm_ind;
+	by ID_nr;
+run;
+data addinfo2 ;
+	merge addinfo(in=a) jonher.dm_ind(rename=(ID_nr=primærbolig));
+	by primærbolig;
+	if a;
+run;	
+data indk (drop=i);
+	set addinfo2;
+	array all1{*} defindk1-defindk40;
+	array all2{*} ind_m0-ind_m2;
+	do i=1 to 3;
+		if alderflyt+cohort>=1981 then all2{i}=all1{cohort+alderflyt+i-1-1980};
+	end;
+run;	
+proc sort data=aegtefalle;
+	by ID_nr;
+run;
+proc sort data=indk;
+	by ID_nr;
+run;
+data want2;
+	merge aegtefalle want1(in=a);
+	by ID_nr;
+	if a;
+run;
+data want2;
+	merge indk want2(in=a);
+	by ID_nr;
+	if a;
+run;	
+data andlun.fuldflyt (drop=nvalues alder1980 foed_aar aegteid1985-aegteid2019 defindk1-defindk40 rig civst1985-civst2019 ); set want2;run;
+
+
+
+/*
+---- BESKRIVELSE AF KODE ----
+Dette program finder populationen. Dette indebærer at identificere individer,
+familiekarateristika, uddannelses- og indkomstsvariable for børn såvel som 
+forældre samt identificere samtlige bopæle hvert individ har haft gennem 
+den udvalgte periode (FORELØBIGT FRA 1970-2020)
+
+-------- OPBYGNING ----------
+1) Hent grunddata fra BEF
+2) Impoter nødvendig data fra UDDA og IND
+3) Sammenfletning af data (...)
+
+--------- INPUT  ------------
+1) 
+
+-------- OUTPUT  ------------
+1) 
+
+
+
+*******************************************************************;
+*******************************************************************; */
+
+/*Lav en cohorte specifikation*/
+data bef(keep=ID_nr KOEN FOED_DAG familie_id far_id_nr mor_id_nr OPR_LAND);
+	set libbef.bef198712;
+
+run;
+data bef;
+	set bef;
+	cohort= year(FOED_DAG);
+	if cohort<1970 or cohort>1985 then cohort=.;
+run;
+
+/*Finder de unikke relevante cohort familie ID'er og udtrækker fra BEF datasættet*/
+data cofam;
+	set bef;
+	if cohort<=.Z then delete;
+	if ID_nr<=.Z then delete;
+	if OPR_LAND^=5100 then delete;
+run;
+/*Fjerner dobbelt individer til sidst*/
+proc sort data=cofam NODUPKEY;
+by ID_nr;
+
+run;
+
+
+/*XXXXXXXXXXXXXXXXXXXX MERGE MED KOMMUNAL DATA XXXXXXXXXXXXXXXXXXXXXXX*/
+/*Åbner højest gennemførte uddanelse og merger på*/
+data flyttemandbob (drop=FOED_DAG cohort); 
+set andlun.fuldflyt; 
+if forstekom=. then counters=.;
+run;
+data bef_flyt;
+	merge cofam(in=a)flyttemandbob;
+	by ID_nr;
+	if a;
+run;
+
+data flyt1985;
+	set bef_flyt;
+	aarflyt=alderflyt+cohort;
+	if aarflyt=1985;
+
+run;
+
+
+/*XXXXXXXXXXXXXXXXXXXX UDDANNELSE XXXXXXXXXXXXXXXXXXXXXXX*/
+/*Åbner højest gennemførte uddanelse og merger på*/
+data udda(drop=FOED_DAG);
+	set jonher.befudda2;
+run; 
+data cofamudda(rename=(hfaudd_tot=HFAUDD));
+	merge bef_flyt(in=a)udda;
+	by ID_nr;
+	if a;
+run;
+
+/*Sammensæt datasæt med forældres højest opnåeded uddannelse*/
+
+/*FAR*/
+/*Procedure til at finde of merge FARS uddannelse*/
+proc sort data=cofamudda;
+by far_id_nr;
+run;
+data udda_far (rename=(ID_nr=far_id_nr hfaudd_tot=far_HFAUDD));
+	set udda;
+	run;
+/*Merge sammen med forældres uddannelse (forskelig variabelnavn*/
+data cofamudda;
+	merge cofamudda(in=a) udda_far;
+	by far_id_nr;
+	if a;
+run;
+
+/*MOR*/
+/*Procedure til at finde of merge MORS uddannelse*/
+proc sort data=cofamudda;
+by mor_id_nr;
+run;
+data udda_mor (rename=(ID_nr=mor_id_nr hfaudd_tot=mor_HFAUDD));
+	set udda;
+	run;
+/*Merge sammen med forældres uddannelse (forskelig variabelnavn*/
+data cofamudda;
+	merge cofamudda(in=a) udda_mor;
+	by mor_id_nr;
+	if a;
+run;
+
+/* 2.1) Indlæs formater til uddannelsestype */
+data cofamudda;
+	set cofamudda;
+	uddgruppe=put(HFAUDD,AUDD_TYPE_L1L3_K.)*1;
+	mor_uddgruppe=put(mor_HFAUDD,AUDD_TYPE_L1L3_K.)*1;
+	far_uddgruppe=put(far_HFAUDD,AUDD_TYPE_L1L3_K.)*1;
+
+run;
+
+data cofamudda;
+set cofamudda;
+run;
+
+
+
+
+
+/*XXXXXXXXXXXXXXXXXXXX INDKOMSTER XXXXXXXXXXXXXXXXXXXXXXX*/
+/*Åbner gns. indkomst og merger på*/
+data indk(keep=ID_nr mindk nvalues);
+	set jonher.dm_ind;
+run;
+proc sort data=indk;
+by ID_nr;
+run;
+proc sort data=cofamudda;
+by ID_nr;
+run;
+data cofamtot(rename=(mindk=indkomst));
+	merge cofamudda(in=a)indk;
+	by ID_nr;
+	if a;
+run;
+/*Sammensæt datasæt med forældres højest opnåeded ind*/
+
+/*FAR*/
+/*Procedure til at finde of merge FARS ind*/
+proc sort data=cofamtot;
+by far_id_nr;
+run;
+data indk_far (rename=(ID_nr=far_id_nr mindk=far_indkomst nvalues=far_nvalues));
+	set indk;
+	run;
+/*Merge sammen med forældres ind (forskelig variabelnavn*/
+data cofamtot;
+	merge cofamtot(in=a) indk_far;
+	by far_id_nr;
+	if a;
+run;
+
+/*MOR*/
+/*Procedure til at finde of merge MORS ind*/
+proc sort data=cofamtot;
+by mor_id_nr;
+run;
+data ind_mor (rename=(ID_nr=mor_id_nr mindk=mor_indkomst nvalues=mor_nvalues));
+	set indk;
+	run;
+/*Merge sammen med forældres ind (forskelig variabelnavn*/
+data cofamtot;
+	merge cofamtot(in=a) ind_mor;
+	by mor_id_nr;
+	if a;
+run;
+
+data cofamtotXindk(drop= tilhorskom1970-tilhorskom2019 OPR_LAND FOED_DAG);
+set cofamtot;
+if hjemmefra_aar<=.Z then delete;
+if sidstekom<=.Z then delete;
+if forstekom<=.Z then delete;
+if indkomst<=.Z then delete;
+if far_indkomst<=.Z and mor_indkomst<=.Z then delete;
+
+run;
+/*data cofamtotXindk;
+set cofamtotXindk;
+if uddgruppe<=.Z then delete;
+if far_uddgruppe<=.Z and mor_uddgruppe<=.Z then delete;
+run;*/
+
+
+data andlun.fuldtsaet; set cofamtotXindk;run;
+
+proc export data=cofamtotXindk
+outfile="D:\FM\andlun\df"
+dbms=dta replace;
+run;
